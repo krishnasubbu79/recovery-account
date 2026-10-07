@@ -145,7 +145,7 @@ Teardown first deletes restored resources tagged with the `AppId`, then the stac
 
 ## 8. Encryption and backup
 
-- **Source:** the Prod LAG vault is encrypted with a Bunker-owned CMK. Its key policy must allow the recovery account to use it through AWS Backup in ap-east-1, and the foundation's Backup service role holds the matching IAM permission.
+- **Source:** the Prod LAG vault is encrypted with a Bunker-owned CMK. Its key policy must allow the recovery account to use it through AWS Backup in ap-east-1, and the foundation's Backup service role holds the matching IAM permission. For infrastructure testing, the foundation can be created with `SourceKmsKeyArn=NONE`, which grants no source-key access and records `NONE`. The restore runbook refuses to start until the foundation has been recreated with the real key.
 - **Restored resources:** encrypted with the app's KMS key.
 - **App vaults:** LAG vaults are locked with 14-day minimum and maximum retention. AWS Backup writes EFS and S3 directly into a LAG vault. RDS for SQL Server and Aurora are backed up first to the standard staging vault as `DELETE_AFTER_COPY` points, then copied into the LAG vault.
 - **Consequence:** any backup taken during a rehearsal locks that app's vault for 14 days. Use a fresh `AppId` for each rehearsal, or take the backup only for the real demo.

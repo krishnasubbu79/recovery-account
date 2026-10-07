@@ -43,7 +43,7 @@ parameters:
   SourceKmsKeyArn:
     type: String
     default: NONE
-    description: Required for CREATE. Bunker-owned CMK that encrypts the shared Prod LAG vault.
+    description: Bunker-owned CMK that encrypts the shared Prod LAG vault. NONE builds the foundation without source-key access (infrastructure testing); restores need the real key.
     allowedPattern: '^NONE$|^arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key/(mrk-)?[0-9a-f-]{32,36}$'
   ToolsBucketName:
     type: String
@@ -126,7 +126,6 @@ mainSteps:
                 ("VpcCidr", events["vpcCidr"]),
                 ("AvailabilityZoneId1", events["availabilityZoneIds"][0]),
                 ("AvailabilityZoneId2", events["availabilityZoneIds"][1]),
-                ("SourceKmsKeyArn", events["sourceKmsKeyArn"]),
             ) if value == "NONE"]
             if missing:
                 raise ValueError("CREATE requires " + ", ".join(missing))
@@ -147,6 +146,8 @@ mainSteps:
             if not set(zone_ids) <= usable:
                 raise ValueError("Availability Zone IDs {} are not available in this Region".format(sorted(set(zone_ids) - usable)))
 
+            if events["sourceKmsKeyArn"] == "NONE":
+                return
             key_region = events["sourceKmsKeyArn"].split(":")[3]
             if key_region != events["automationRegion"]:
                 raise ValueError("SourceKmsKeyArn must be in {}, the Region of the shared vault".format(events["automationRegion"]))

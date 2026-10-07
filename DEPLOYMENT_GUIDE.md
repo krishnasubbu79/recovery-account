@@ -34,7 +34,7 @@ Each step says **which account** to use and ends with a **check**. Don't move on
 | Delegated Admin and recovery account IDs | Organizations console, or `aws sts get-caller-identity` |
 | Two AZ IDs in ap-east-1 | Part A, step 3 |
 | VPC CIDR | A private `/20` that does not overlap networks you may connect later, for example `10.240.0.0/20` |
-| Bunker CMK ARN | The key that encrypts the Prod LAG vault, in the Bunker key account, ap-east-1 |
+| Bunker CMK ARN (optional now) | The key that encrypts the Prod LAG vault, in the Bunker key account, ap-east-1. Use `NONE` to test the infrastructure; restores need the real key |
 | Tools bucket (optional) | An S3 bucket with `sqlcmd` for the validation host, or `NONE` |
 
 **ap-east-1 must be enabled.** It is an opt-in Region. Check each account with its own credentials:
@@ -46,7 +46,7 @@ aws account get-region-opt-status --region-name ap-east-1 --query RegionOptStatu
 
 If it says `DISABLED`, enable it with `aws account enable-region --region-name ap-east-1` and wait until the status is `ENABLED`. This can take a few minutes.
 
-> **Not needed yet:** the Bunker CMK key-policy change. Creating the foundation only records the key ARN in an IAM policy. The key policy matters when restores start in step 3.
+> **Not needed yet:** the Bunker CMK and its key policy. With `SOURCE_KMS_KEY_ARN='NONE'` the foundation is built without source-key access. Before restores start in step 3, rerun `DELETE` and then `CREATE` with the real key ARN, and add the key-policy statement from the README. That takes about 10 minutes while no app environments exist.
 
 ---
 

@@ -25,8 +25,12 @@ Parameters:
     AllowedPattern: '^[a-z]+[0-9]+-az[0-9]+$'
   SourceKmsKeyArn:
     Type: String
-    Description: Bunker-owned CMK that encrypts the shared Prod LAG vault.
-    AllowedPattern: '^arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key/(mrk-)?[0-9a-f-]{32,36}$'
+    Default: NONE
+    Description: >-
+      Bunker-owned CMK that encrypts the shared Prod LAG vault. NONE builds the
+      foundation without source-key access, for infrastructure testing;
+      restores need the real key.
+    AllowedPattern: '^NONE$|^arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key/(mrk-)?[0-9a-f-]{32,36}$'
   ToolsBucketName:
     Type: String
     Default: NONE
@@ -45,6 +49,7 @@ Rules:
 
 Conditions:
   HasToolsBucket: !Not [!Equals [!Ref ToolsBucketName, NONE]]
+  HasSourceKey: !Not [!Equals [!Ref SourceKmsKeyArn, NONE]]
 
 Resources:
   RecoveryVpc:
@@ -303,24 +308,27 @@ Resources:
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AWSBackupServiceRolePolicyForS3Backup'
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AWSBackupServiceRolePolicyForS3Restore'
       Policies:
-        - PolicyName: UseBunkerSourceKey
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: DecryptSharedLagRecoveryPoints
-                Effect: Allow
-                Action:
-                  - kms:Decrypt
-                  - kms:DescribeKey
-                  - kms:ReEncryptFrom
-                Resource: !Ref SourceKmsKeyArn
-              - Sid: CreateServiceGrantsOnSourceKey
-                Effect: Allow
-                Action: kms:CreateGrant
-                Resource: !Ref SourceKmsKeyArn
-                Condition:
-                  Bool:
-                    kms:GrantIsForAWSResource: 'true'
+        - !If
+          - HasSourceKey
+          - PolicyName: UseBunkerSourceKey
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: DecryptSharedLagRecoveryPoints
+                  Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:DescribeKey
+                    - kms:ReEncryptFrom
+                  Resource: !Ref SourceKmsKeyArn
+                - Sid: CreateServiceGrantsOnSourceKey
+                  Effect: Allow
+                  Action: kms:CreateGrant
+                  Resource: !Ref SourceKmsKeyArn
+                  Condition:
+                    Bool:
+                      kms:GrantIsForAWSResource: 'true'
+          - !Ref AWS::NoValue
 
   ValidationHostRole:
     Type: AWS::IAM::Role

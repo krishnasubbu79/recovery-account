@@ -181,9 +181,17 @@ class RunbookTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "wait for it to finish"):
             self.plan(self.events(), None)
 
-    def test_create_requires_network_and_key_inputs(self):
-        with self.assertRaisesRegex(ValueError, "CREATE requires VpcCidr, SourceKmsKeyArn"):
-            self.plan(self.events(vpcCidr="NONE", sourceKmsKeyArn="NONE"), None)
+    def test_create_requires_network_inputs(self):
+        with self.assertRaisesRegex(ValueError, "CREATE requires VpcCidr, AvailabilityZoneId2$"):
+            self.plan(self.events(vpcCidr="NONE", availabilityZoneIds=["ape1-az1", "NONE"]), None)
+
+    def test_create_without_source_key_is_allowed_for_infrastructure_testing(self):
+        self.assertEqual(self.plan(self.events(sourceKmsKeyArn="NONE"), None)["NextAction"], "CREATE_STACK")
+
+    def test_adding_the_source_key_later_requires_delete_then_create(self):
+        self.existing(SourceKmsKeyArn="NONE")
+        with self.assertRaisesRegex(ValueError, "different SourceKmsKeyArn.*DELETE, then CREATE"):
+            self.plan(self.events(), None)
 
     def test_public_or_misaligned_cidr_is_refused(self):
         with self.assertRaisesRegex(ValueError, "inside 10.0.0.0/8"):

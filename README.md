@@ -70,7 +70,7 @@ recovery-foundation (ap-east-1)
 
 1. **Enable ap-east-1** (an opt-in Region) in Delegated Admin, the recovery account, the Bunker key account, and the Prod LAG account.
 2. **Confirm AWS Backup support** in ap-east-1 for logically air-gapped vaults with RDS for SQL Server, Aurora PostgreSQL, EFS, and S3.
-3. **Bunker source CMK key policy.** Allow the recovery account to use the key through AWS Backup, for example:
+3. **Bunker source CMK key policy** (needed before restores, not to create the foundation). Allow the recovery account to use the key through AWS Backup, for example:
 
    ```json
    {
@@ -135,6 +135,7 @@ aws ssm start-automation-execution --region ap-east-1 \
   --document-name Recovery-ManageFoundation \
   --target-locations "Accounts=$RECOVERY_ACCOUNT_ID,Regions=ap-east-1,ExecutionRoleName=AWS-SystemsManager-AutomationExecutionRole" \
   --parameters "AutomationAssumeRole=$EXEC_ROLE,Action=CREATE,VpcCidr=10.240.0.0/20,AvailabilityZoneId1=ape1-az1,AvailabilityZoneId2=ape1-az2,SourceKmsKeyArn=<bunker-cmk-arn>"
+# SourceKmsKeyArn=NONE builds the foundation without source-key access, for infrastructure testing.
 
 # Tear it down (after every app environment is gone)
 aws ssm start-automation-execution --region ap-east-1 \
@@ -151,8 +152,8 @@ Find the real AZ IDs with `aws ec2 describe-availability-zones --region ap-east-
 python3 -m unittest discover -s tests -v      # requires PyYAML
 ```
 
-24 offline tests cover:
-- **CREATE planning:** absent, identical, different inputs, different template, failed and in-progress stacks, missing inputs, CIDR, AZ, key Region, and wrong Region or account;
+26 offline tests cover:
+- **CREATE planning:** absent, identical, different inputs, different template, failed and in-progress stacks, missing inputs, no source key yet, CIDR, AZ, key Region, and wrong Region or account;
 - **DELETE planning:** absent, blocked by app stacks, blocked by resources in the VPC, and failed stacks;
 - **Verification:** subnet size, routes out of the VPC, missing endpoints, endpoint security-group rules, and template hash;
 - **Rendering:** the template is embedded byte-for-byte and its hash is pinned.
