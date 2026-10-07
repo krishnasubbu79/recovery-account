@@ -1,0 +1,474 @@
+---
+description: |-
+  Recovery-ManageFoundation. Creates or deletes the persistent recovery
+  foundation stack (recovery-foundation) in the single Recovery App account.
+  Stored in Bunker Delegated Admin and run in the recovery account through SSM
+  multi-account automation.
+
+  CREATE validates the inputs, creates the stack from the template embedded at
+  render time (pinned by SHA-256), and verifies what was actually built. A
+  rerun with identical inputs changes nothing; different inputs are refused.
+
+  DELETE refuses while any recovery-app-* stack exists or anything other than
+  the foundation's own endpoints still has a network interface in the VPC. The
+  flow-log group and foundation KMS key are retained as evidence.
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: The recovery account's AWS-SystemsManager-AutomationExecutionRole.
+    allowedPattern: '^arn:aws:iam::[0-9]{12}:role/AWS-SystemsManager-AutomationExecutionRole$'
+  Action:
+    type: String
+    allowedValues:
+      - CREATE
+      - DELETE
+  VpcCidr:
+    type: String
+    default: NONE
+    description: Required for CREATE. A private /20, for example 10.240.0.0/20.
+    allowedPattern: '^NONE$|^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/20$'
+  AvailabilityZoneId1:
+    type: String
+    default: NONE
+    description: Required for CREATE. AZ ID for subnet A and the interface endpoints, for example ape1-az1.
+    allowedPattern: '^NONE$|^[a-z]+[0-9]+-az[0-9]+$'
+  AvailabilityZoneId2:
+    type: String
+    default: NONE
+    description: Required for CREATE. AZ ID for subnet B, for example ape1-az2.
+    allowedPattern: '^NONE$|^[a-z]+[0-9]+-az[0-9]+$'
+  SourceKmsKeyArn:
+    type: String
+    default: NONE
+    description: Required for CREATE. Bunker-owned CMK that encrypts the shared Prod LAG vault.
+    allowedPattern: '^NONE$|^arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key/(mrk-)?[0-9a-f-]{32,36}$'
+  ToolsBucketName:
+    type: String
+    default: NONE
+    description: Optional bucket with validation tools such as sqlcmd. NONE disables it.
+    allowedPattern: '^NONE$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+  FlowLogRetentionDays:
+    type: String
+    default: '90'
+    allowedValues: ['7', '14', '30', '60', '90', '180', '365']
+
+mainSteps:
+  - name: PlanFoundationAction
+    action: aws:executeScript
+    timeoutSeconds: 300
+    onFailure: Abort
+    inputs:
+      Runtime: python3.11
+      Handler: plan
+      InputPayload:
+        action: '{{ Action }}'
+        automationRegion: '{{ global:REGION }}'
+        accountId: '{{ global:ACCOUNT_ID }}'
+        expectedAccountId: 'RECOVERY_ACCOUNT_ID'
+        approvedRegionsCsv: 'RECOVERY_REGION'
+        approvedTemplateSha256: 'APPROVED_TEMPLATE_SHA256'
+        vpcCidr: '{{ VpcCidr }}'
+        availabilityZoneIds:
+          - '{{ AvailabilityZoneId1 }}'
+          - '{{ AvailabilityZoneId2 }}'
+        sourceKmsKeyArn: '{{ SourceKmsKeyArn }}'
+        toolsBucketName: '{{ ToolsBucketName }}'
+        flowLogRetentionDays: '{{ FlowLogRetentionDays }}'
+      Script: |-
+        import boto3
+        import hashlib
+        import ipaddress
+        import re
+        from botocore.exceptions import ClientError
+
+        STACK = "recovery-foundation"
+        APP_PREFIX = "recovery-app-"
+        HEALTHY = {"CREATE_COMPLETE", "UPDATE_COMPLETE"}
+        ACTIVE_STATUSES = [
+            "CREATE_IN_PROGRESS", "CREATE_FAILED", "CREATE_COMPLETE", "ROLLBACK_IN_PROGRESS",
+            "ROLLBACK_FAILED", "ROLLBACK_COMPLETE", "DELETE_IN_PROGRESS", "DELETE_FAILED",
+            "UPDATE_IN_PROGRESS", "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS", "UPDATE_COMPLETE",
+            "UPDATE_FAILED", "UPDATE_ROLLBACK_IN_PROGRESS", "UPDATE_ROLLBACK_FAILED",
+            "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS", "UPDATE_ROLLBACK_COMPLETE",
+            "REVIEW_IN_PROGRESS", "IMPORT_IN_PROGRESS", "IMPORT_COMPLETE",
+            "IMPORT_ROLLBACK_IN_PROGRESS", "IMPORT_ROLLBACK_FAILED", "IMPORT_ROLLBACK_COMPLETE",
+        ]
+        PRIVATE_RANGES = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+
+        def describe_stack(cloudformation):
+            try:
+                return cloudformation.describe_stacks(StackName=STACK)["Stacks"][0]
+            except ClientError as error:
+                details = error.response.get("Error", {})
+                if details.get("Code") == "ValidationError" and "does not exist" in details.get("Message", ""):
+                    return None
+                raise
+
+        def template_sha256(cloudformation):
+            body = cloudformation.get_template(StackName=STACK, TemplateStage="Original")["TemplateBody"]
+            return hashlib.sha256(body.encode("utf-8")).hexdigest() if isinstance(body, str) else None
+
+        def desired_parameters(events):
+            return {
+                "VpcCidr": events["vpcCidr"],
+                "AvailabilityZoneId1": events["availabilityZoneIds"][0],
+                "AvailabilityZoneId2": events["availabilityZoneIds"][1],
+                "SourceKmsKeyArn": events["sourceKmsKeyArn"],
+                "ToolsBucketName": events["toolsBucketName"],
+                "FlowLogRetentionDays": events["flowLogRetentionDays"],
+            }
+
+        def validate_create_inputs(events, ec2):
+            missing = [name for name, value in (
+                ("VpcCidr", events["vpcCidr"]),
+                ("AvailabilityZoneId1", events["availabilityZoneIds"][0]),
+                ("AvailabilityZoneId2", events["availabilityZoneIds"][1]),
+                ("SourceKmsKeyArn", events["sourceKmsKeyArn"]),
+            ) if value == "NONE"]
+            if missing:
+                raise ValueError("CREATE requires " + ", ".join(missing))
+            try:
+                vpc = ipaddress.ip_network(events["vpcCidr"], strict=True)
+            except ValueError:
+                raise ValueError("VpcCidr must be an aligned network address, for example 10.240.0.0/20")
+            if vpc.prefixlen != 20 or not any(vpc.subnet_of(r) for r in PRIVATE_RANGES):
+                raise ValueError("VpcCidr must be a /20 inside 10.0.0.0/8, 172.16.0.0/12, or 192.168.0.0/16")
+
+            zone_ids = events["availabilityZoneIds"]
+            if zone_ids[0] == zone_ids[1]:
+                raise ValueError("The two Availability Zone IDs must be different")
+            zones = ec2.describe_availability_zones(
+                Filters=[{"Name": "zone-id", "Values": zone_ids}])["AvailabilityZones"]
+            usable = {z["ZoneId"] for z in zones
+                      if z.get("State") == "available" and z.get("ZoneType", "availability-zone") == "availability-zone"}
+            if not set(zone_ids) <= usable:
+                raise ValueError("Availability Zone IDs {} are not available in this Region".format(sorted(set(zone_ids) - usable)))
+
+            key_region = events["sourceKmsKeyArn"].split(":")[3]
+            if key_region != events["automationRegion"]:
+                raise ValueError("SourceKmsKeyArn must be in {}, the Region of the shared vault".format(events["automationRegion"]))
+
+        def app_stacks(cloudformation):
+            names, token = [], None
+            while True:
+                arguments = {"StackStatusFilter": ACTIVE_STATUSES}
+                if token:
+                    arguments["NextToken"] = token
+                response = cloudformation.list_stacks(**arguments)
+                names += [s["StackName"] for s in response.get("StackSummaries", [])
+                          if s["StackName"].startswith(APP_PREFIX)]
+                token = response.get("NextToken")
+                if not token:
+                    return sorted(names)
+
+        def foreign_interfaces(cloudformation, ec2):
+            """Network interfaces in the VPC that are not the foundation's own endpoints."""
+            try:
+                vpc_id = cloudformation.describe_stack_resource(
+                    StackName=STACK, LogicalResourceId="RecoveryVpc")["StackResourceDetail"]["PhysicalResourceId"]
+            except ClientError:
+                return []
+            found, token = [], None
+            while True:
+                arguments = {"Filters": [{"Name": "vpc-id", "Values": [vpc_id]}]}
+                if token:
+                    arguments["NextToken"] = token
+                response = ec2.describe_network_interfaces(**arguments)
+                found += ["{} ({})".format(i["NetworkInterfaceId"], i.get("Description", "no description"))
+                          for i in response.get("NetworkInterfaces", [])
+                          if i.get("InterfaceType") != "vpc_endpoint"]
+                token = response.get("NextToken")
+                if not token:
+                    return found
+
+        def plan(events, context):
+            approved = {r.strip() for r in events["approvedRegionsCsv"].split(",") if r.strip()}
+            if events["automationRegion"] not in approved:
+                raise ValueError("Recovery-ManageFoundation runs only in " + ", ".join(sorted(approved)))
+            if events["accountId"] != events["expectedAccountId"]:
+                raise ValueError("This document must run in the recovery account {}".format(events["expectedAccountId"]))
+
+            cloudformation = boto3.client("cloudformation", region_name=events["automationRegion"])
+            ec2 = boto3.client("ec2", region_name=events["automationRegion"])
+            stack = describe_stack(cloudformation)
+            status = stack["StackStatus"] if stack else "NONE"
+            if status.endswith("_IN_PROGRESS"):
+                raise RuntimeError("The foundation stack is {}; wait for it to finish".format(status))
+
+            if events["action"] == "CREATE":
+                validate_create_inputs(events, ec2)
+                if stack is None:
+                    return {"NextAction": "CREATE_STACK", "StackStatus": status}
+                if status not in HEALTHY:
+                    raise RuntimeError("The foundation stack is {}; run DELETE, then CREATE".format(status))
+                current = {p["ParameterKey"]: p.get("ParameterValue", "") for p in stack.get("Parameters", [])}
+                desired = desired_parameters(events)
+                changed = sorted(k for k in desired if current.get(k) != desired[k])
+                if changed:
+                    raise ValueError("The foundation already exists with different {}. It is never changed "
+                                     "in place; run DELETE, then CREATE".format(", ".join(changed)))
+                if template_sha256(cloudformation) != events["approvedTemplateSha256"]:
+                    raise ValueError("The foundation was created from a different template version; "
+                                     "run DELETE, then CREATE")
+                return {"NextAction": "ALREADY_EXISTS", "StackStatus": status}
+
+            if stack is None:
+                return {"NextAction": "ALREADY_DELETED", "StackStatus": status}
+            apps = app_stacks(cloudformation)
+            if apps:
+                raise RuntimeError("Tear down these app environments first: " + ", ".join(apps))
+            interfaces = foreign_interfaces(cloudformation, ec2)
+            if interfaces:
+                raise RuntimeError("Restored resources or validation hosts still use the VPC: " + "; ".join(interfaces))
+            return {"NextAction": "DELETE_STACK", "StackStatus": status}
+    outputs:
+      - Name: NextAction
+        Selector: $.Payload.NextAction
+        Type: String
+      - Name: StackStatus
+        Selector: $.Payload.StackStatus
+        Type: String
+
+  - name: ChooseFoundationAction
+    action: aws:branch
+    inputs:
+      Choices:
+        - NextStep: CreateFoundationStack
+          Variable: '{{ PlanFoundationAction.NextAction }}'
+          StringEquals: CREATE_STACK
+        - NextStep: VerifyFoundation
+          Variable: '{{ PlanFoundationAction.NextAction }}'
+          StringEquals: ALREADY_EXISTS
+        - NextStep: DeleteFoundationStack
+          Variable: '{{ PlanFoundationAction.NextAction }}'
+          StringEquals: DELETE_STACK
+        - NextStep: VerifyFoundationDeleted
+          Variable: '{{ PlanFoundationAction.NextAction }}'
+          StringEquals: ALREADY_DELETED
+
+  # A failed create is deleted automatically, so a corrected rerun starts clean.
+  # Retained resources (flow-log group, KMS key) are left as evidence.
+  - name: CreateFoundationStack
+    action: aws:createStack
+    timeoutSeconds: 3600
+    onFailure: Abort
+    nextStep: VerifyFoundation
+    inputs:
+      StackName: recovery-foundation
+      RoleARN: 'arn:aws:iam::RECOVERY_ACCOUNT_ID:role/RecoveryCloudFormationRole'
+      Capabilities:
+        - CAPABILITY_IAM
+      OnFailure: DELETE
+      Tags:
+        - Key: ManagedBy
+          Value: Recovery-ManageFoundation
+        - Key: Purpose
+          Value: RecoveryFoundation
+      Parameters:
+        - ParameterKey: VpcCidr
+          ParameterValue: '{{ VpcCidr }}'
+        - ParameterKey: AvailabilityZoneId1
+          ParameterValue: '{{ AvailabilityZoneId1 }}'
+        - ParameterKey: AvailabilityZoneId2
+          ParameterValue: '{{ AvailabilityZoneId2 }}'
+        - ParameterKey: SourceKmsKeyArn
+          ParameterValue: '{{ SourceKmsKeyArn }}'
+        - ParameterKey: ToolsBucketName
+          ParameterValue: '{{ ToolsBucketName }}'
+        - ParameterKey: FlowLogRetentionDays
+          ParameterValue: '{{ FlowLogRetentionDays }}'
+      TemplateBody: |
+        __FOUNDATION_TEMPLATE_BODY__
+
+  - name: VerifyFoundation
+    action: aws:executeScript
+    timeoutSeconds: 300
+    onFailure: Abort
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: verify
+      InputPayload:
+        automationRegion: '{{ global:REGION }}'
+        approvedTemplateSha256: 'APPROVED_TEMPLATE_SHA256'
+      Script: |-
+        import boto3
+        import hashlib
+        import ipaddress
+
+        STACK = "recovery-foundation"
+        PREFIX = "/recovery/foundation"
+        DENY_ALL_EGRESS_CIDR = "255.255.255.255/32"
+        INTERFACE_SERVICES = ("ssm", "ssmmessages", "ec2messages")
+        REQUIRED = ("vpc-id", "vpc-cidr", "subnet-a-id", "subnet-b-id", "db-subnet-group-name",
+                    "endpoint-security-group-id", "backup-service-role-arn",
+                    "validation-instance-profile-arn", "source-kms-key-arn", "template-version")
+
+        def read_parameters(ssm):
+            values, token = {}, None
+            while True:
+                arguments = {"Path": PREFIX, "Recursive": True}
+                if token:
+                    arguments["NextToken"] = token
+                response = ssm.get_parameters_by_path(**arguments)
+                for parameter in response.get("Parameters", []):
+                    values[parameter["Name"][len(PREFIX) + 1:]] = parameter["Value"]
+                token = response.get("NextToken")
+                if not token:
+                    return values
+
+        def verify_subnets(ec2, config, stack_parameters):
+            expected = list(ipaddress.ip_network(config["vpc-cidr"]).subnets(new_prefix=24))[:2]
+            zone_ids = [stack_parameters["AvailabilityZoneId1"], stack_parameters["AvailabilityZoneId2"]]
+            ids = [config["subnet-a-id"], config["subnet-b-id"]]
+            subnets = {s["SubnetId"]: s for s in ec2.describe_subnets(SubnetIds=ids)["Subnets"]}
+            for index, subnet_id in enumerate(ids):
+                subnet = subnets.get(subnet_id)
+                if subnet is None or subnet["VpcId"] != config["vpc-id"]:
+                    raise RuntimeError("Subnet {} is missing or outside the recovery VPC".format(subnet_id))
+                if subnet["CidrBlock"] != str(expected[index]):
+                    raise RuntimeError("Subnet {} is {}, expected {}".format(subnet_id, subnet["CidrBlock"], expected[index]))
+                if subnet["AvailabilityZoneId"] != zone_ids[index]:
+                    raise RuntimeError("Subnet {} is not in AZ ID {}".format(subnet_id, zone_ids[index]))
+                if subnet.get("MapPublicIpOnLaunch"):
+                    raise RuntimeError("Subnet {} assigns public IP addresses".format(subnet_id))
+
+        def verify_routes(ec2, vpc_id):
+            tables = ec2.describe_route_tables(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["RouteTables"]
+            for table in tables:
+                for route in table.get("Routes", []):
+                    local = route.get("GatewayId") == "local"
+                    s3_gateway = bool(route.get("DestinationPrefixListId")) and route.get("GatewayId", "").startswith("vpce-")
+                    if not (local or s3_gateway):
+                        raise RuntimeError("Route table {} has a route to {} via {}".format(
+                            table["RouteTableId"],
+                            route.get("DestinationCidrBlock") or route.get("DestinationPrefixListId") or "?",
+                            route.get("GatewayId") or route.get("NatGatewayId") or route.get("TransitGatewayId")
+                            or route.get("VpcPeeringConnectionId") or "another target"))
+
+        def verify_endpoints(ec2, vpc_id, region):
+            endpoints = ec2.describe_vpc_endpoints(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["VpcEndpoints"]
+            available = {(e["ServiceName"], e["VpcEndpointType"]) for e in endpoints
+                         if e.get("State", "").lower() == "available"}
+            expected = {("com.amazonaws.{}.{}".format(region, s), "Interface") for s in INTERFACE_SERVICES}
+            expected.add(("com.amazonaws.{}.s3".format(region), "Gateway"))
+            missing = sorted(name for name, _ in expected - available)
+            if missing:
+                raise RuntimeError("These VPC endpoints are not available: " + ", ".join(missing))
+
+        def verify_endpoint_group(ec2, group_id):
+            group = ec2.describe_security_groups(GroupIds=[group_id])["SecurityGroups"][0]
+            for permission in group.get("IpPermissions", []):
+                if permission.get("IpRanges") or permission.get("Ipv6Ranges") or permission.get("PrefixListIds"):
+                    raise RuntimeError("The endpoint security group has address-based ingress")
+                if (permission.get("IpProtocol"), permission.get("FromPort"), permission.get("ToPort")) != ("tcp", 443, 443):
+                    raise RuntimeError("The endpoint security group allows more than HTTPS")
+            for permission in group.get("IpPermissionsEgress", []):
+                ranges = [r.get("CidrIp") for r in permission.get("IpRanges", [])]
+                if ranges != [DENY_ALL_EGRESS_CIDR] or permission.get("UserIdGroupPairs") or permission.get("Ipv6Ranges"):
+                    raise RuntimeError("The endpoint security group has egress beyond the placeholder rule")
+
+        def verify(events, context):
+            region = events["automationRegion"]
+            cloudformation = boto3.client("cloudformation", region_name=region)
+            ec2 = boto3.client("ec2", region_name=region)
+            ssm = boto3.client("ssm", region_name=region)
+
+            stack = cloudformation.describe_stacks(StackName=STACK)["Stacks"][0]
+            if stack["StackStatus"] not in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
+                raise RuntimeError("The foundation stack is " + stack["StackStatus"])
+            body = cloudformation.get_template(StackName=STACK, TemplateStage="Original")["TemplateBody"]
+            if not isinstance(body, str) or hashlib.sha256(body.encode("utf-8")).hexdigest() != events["approvedTemplateSha256"]:
+                raise RuntimeError("The foundation stack was not created from the approved template")
+
+            config = read_parameters(ssm)
+            missing = [name for name in REQUIRED if not config.get(name)]
+            if missing:
+                raise RuntimeError("Missing foundation parameters: " + ", ".join(missing))
+            stack_parameters = {p["ParameterKey"]: p.get("ParameterValue", "") for p in stack.get("Parameters", [])}
+
+            verify_subnets(ec2, config, stack_parameters)
+            verify_routes(ec2, config["vpc-id"])
+            verify_endpoints(ec2, config["vpc-id"], region)
+            verify_endpoint_group(ec2, config["endpoint-security-group-id"])
+            return {
+                "Status": "FOUNDATION_READY",
+                "VpcId": config["vpc-id"],
+                "SubnetAId": config["subnet-a-id"],
+                "SubnetBId": config["subnet-b-id"],
+                "ParameterPath": PREFIX,
+            }
+    outputs:
+      - Name: Status
+        Selector: $.Payload.Status
+        Type: String
+      - Name: VpcId
+        Selector: $.Payload.VpcId
+        Type: String
+      - Name: SubnetAId
+        Selector: $.Payload.SubnetAId
+        Type: String
+      - Name: SubnetBId
+        Selector: $.Payload.SubnetBId
+        Type: String
+      - Name: ParameterPath
+        Selector: $.Payload.ParameterPath
+        Type: String
+
+  - name: DeleteFoundationStack
+    action: aws:deleteStack
+    timeoutSeconds: 3600
+    onFailure: Abort
+    nextStep: VerifyFoundationDeleted
+    inputs:
+      StackName: recovery-foundation
+      RoleARN: 'arn:aws:iam::RECOVERY_ACCOUNT_ID:role/RecoveryCloudFormationRole'
+
+  - name: VerifyFoundationDeleted
+    action: aws:executeScript
+    timeoutSeconds: 120
+    onFailure: Abort
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: verify_deleted
+      InputPayload:
+        automationRegion: '{{ global:REGION }}'
+      Script: |-
+        import boto3
+        from botocore.exceptions import ClientError
+
+        def verify_deleted(events, context):
+            cloudformation = boto3.client("cloudformation", region_name=events["automationRegion"])
+            try:
+                stack = cloudformation.describe_stacks(StackName="recovery-foundation")["Stacks"][0]
+            except ClientError as error:
+                details = error.response.get("Error", {})
+                if details.get("Code") == "ValidationError" and "does not exist" in details.get("Message", ""):
+                    stack = None
+                else:
+                    raise
+            if stack is not None and stack["StackStatus"] != "DELETE_COMPLETE":
+                raise RuntimeError("The foundation stack is " + stack["StackStatus"])
+            return {
+                "Status": "FOUNDATION_DELETED",
+                "Retained": "The flow-log group and the foundation KMS key are retained as evidence; the alias is removed.",
+            }
+    outputs:
+      - Name: Status
+        Selector: $.Payload.Status
+        Type: String
+      - Name: Retained
+        Selector: $.Payload.Retained
+        Type: String
+
+outputs:
+  - PlanFoundationAction.NextAction
+  - VerifyFoundation.Status
+  - VerifyFoundation.VpcId
+  - VerifyFoundation.SubnetAId
+  - VerifyFoundation.SubnetBId
+  - VerifyFoundationDeleted.Status

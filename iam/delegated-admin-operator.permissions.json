@@ -1,0 +1,41 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "StartRecoveryAccountAutomation",
+      "Effect": "Allow",
+      "Action": "ssm:StartAutomationExecution",
+      "Resource": [
+        "arn:aws:ssm:RECOVERY_REGION:DELEGATED_ADMIN_ACCOUNT_ID:document/Recovery-ManageFoundation",
+        "arn:aws:ssm:RECOVERY_REGION:DELEGATED_ADMIN_ACCOUNT_ID:automation-execution/*"
+      ]
+    },
+    {
+      "Sid": "ListRecoveryAccountExecutions",
+      "Effect": "Allow",
+      "Action": "ssm:DescribeAutomationExecutions",
+      "Resource": "*"
+    },
+    {
+      "Sid": "InspectAndStopRecoveryAccountExecutions",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:DescribeAutomationStepExecutions",
+        "ssm:GetAutomationExecution",
+        "ssm:StopAutomationExecution"
+      ],
+      "Resource": "arn:aws:ssm:RECOVERY_REGION:DELEGATED_ADMIN_ACCOUNT_ID:automation-execution/*"
+    },
+    {
+      "Sid": "PassOnlyTheAutomationAdministrationRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::DELEGATED_ADMIN_ACCOUNT_ID:role/AWS-SystemsManager-AutomationAdministrationRole",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ssm.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

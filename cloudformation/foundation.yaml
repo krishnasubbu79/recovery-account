@@ -1,0 +1,432 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Persistent recovery foundation for the single Recovery App account: an
+  isolated VPC with two /24 subnets, private Systems Manager access for
+  validation hosts, an S3 gateway endpoint limited to package repositories and
+  the validation-tools bucket, and the AWS Backup service role. App-specific
+  security groups, vaults, and keys belong to the per-app stacks.
+
+Parameters:
+  TemplateVersion:
+    Type: String
+    Default: 1.0.0
+    AllowedPattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+  VpcCidr:
+    Type: String
+    Description: Private /20 for the recovery VPC. Subnets are its first two /24s.
+    AllowedPattern: '^(10|172|192)\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/20$'
+  AvailabilityZoneId1:
+    Type: String
+    Description: AZ ID for subnet A, which also hosts the interface endpoints (for example ape1-az1).
+    AllowedPattern: '^[a-z]+[0-9]+-az[0-9]+$'
+  AvailabilityZoneId2:
+    Type: String
+    Description: AZ ID for subnet B (for example ape1-az2).
+    AllowedPattern: '^[a-z]+[0-9]+-az[0-9]+$'
+  SourceKmsKeyArn:
+    Type: String
+    Description: Bunker-owned CMK that encrypts the shared Prod LAG vault.
+    AllowedPattern: '^arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key/(mrk-)?[0-9a-f-]{32,36}$'
+  ToolsBucketName:
+    Type: String
+    Default: NONE
+    Description: Bucket holding validation tools (for example sqlcmd) that are not in the Amazon Linux repositories. NONE disables it.
+    AllowedPattern: '^NONE$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+  FlowLogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+
+Rules:
+  DistinctAvailabilityZones:
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AvailabilityZoneId1, !Ref AvailabilityZoneId2]]
+        AssertDescription: The two Availability Zone IDs must be different.
+
+Conditions:
+  HasToolsBucket: !Not [!Equals [!Ref ToolsBucketName, NONE]]
+
+Resources:
+  RecoveryVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: recovery-foundation-vpc
+
+  # Fn::Cidr's third argument is the number of host bits: 8 gives /24 subnets.
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref RecoveryVpc
+      AvailabilityZoneId: !Ref AvailabilityZoneId1
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 2, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: recovery-foundation-subnet-a
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref RecoveryVpc
+      AvailabilityZoneId: !Ref AvailabilityZoneId2
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 2, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: recovery-foundation-subnet-b
+
+  RouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref RecoveryVpc
+      Tags:
+        - Key: Name
+          Value: recovery-foundation-subnet-a
+
+  RouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref RecoveryVpc
+      Tags:
+        - Key: Name
+          Value: recovery-foundation-subnet-b
+
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref RouteTableA
+
+  SubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref RouteTableB
+
+  # The only route out of the VPC. Its policy allows reads from the Amazon
+  # Linux 2023 package repositories and the validation-tools bucket only, so
+  # it cannot be used to move data to any other bucket.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref RecoveryVpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds:
+        - !Ref RouteTableA
+        - !Ref RouteTableB
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AmazonLinuxPackageRepositories
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::al2023-repos-${AWS::Region}-*/*'
+          - !If
+            - HasToolsBucket
+            - Sid: ValidationTools
+              Effect: Allow
+              Principal: '*'
+              Action: s3:GetObject
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::${ToolsBucketName}/*'
+            - !Ref AWS::NoValue
+
+  # Per-app stacks add HTTPS ingress from their own validation-client group.
+  # An empty egress list would keep the default allow-all rule, so the group
+  # carries a placeholder rule that matches no traffic.
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Systems Manager interface endpoints; HTTPS ingress is added per app.
+      VpcId: !Ref RecoveryVpc
+      SecurityGroupEgress:
+        - IpProtocol: icmp
+          FromPort: 252
+          ToPort: 86
+          CidrIp: 255.255.255.255/32
+          Description: Disallow all egress.
+      Tags:
+        - Key: Name
+          Value: recovery-foundation-endpoints
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref RecoveryVpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref SubnetA
+      SecurityGroupIds:
+        - !GetAtt EndpointSecurityGroup.GroupId
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref RecoveryVpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref SubnetA
+      SecurityGroupIds:
+        - !GetAtt EndpointSecurityGroup.GroupId
+
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref RecoveryVpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref SubnetA
+      SecurityGroupIds:
+        - !GetAtt EndpointSecurityGroup.GroupId
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: recovery-foundation-db
+      DBSubnetGroupDescription: Restored RDS for SQL Server and Aurora PostgreSQL databases.
+      SubnetIds:
+        - !Ref SubnetA
+        - !Ref SubnetB
+
+  # Retained on teardown so encrypted flow-log evidence stays readable.
+  FoundationKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Recovery foundation key (flow logs).
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountIamPolicies
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowCloudWatchLogsForFoundationFlowLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Decrypt*
+              - kms:Describe*
+              - kms:Encrypt*
+              - kms:GenerateDataKey*
+              - kms:ReEncrypt*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AWS::StackName}-FlowLogGroup-*'
+
+  FoundationKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/recovery/foundation
+      TargetKeyId: !Ref FoundationKey
+
+  # Retained on teardown as evidence. No fixed name, so a recreated
+  # foundation never collides with a retained group.
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !GetAtt FoundationKey.Arn
+      RetentionInDays: !Ref FlowLogRetentionDays
+
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: PublishFoundationFlowLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${FlowLogGroup.Arn}:*'
+
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref RecoveryVpc
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      MaxAggregationInterval: 60
+
+  # One AWS Backup service role for restores from the shared Prod LAG vault and
+  # for backing validated data into the per-app LAG vaults. Per-app key policies
+  # grant it use of each app key.
+  BackupServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AWSBackupServiceRolePolicyForS3Backup'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AWSBackupServiceRolePolicyForS3Restore'
+      Policies:
+        - PolicyName: UseBunkerSourceKey
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DecryptSharedLagRecoveryPoints
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:ReEncryptFrom
+                Resource: !Ref SourceKmsKeyArn
+              - Sid: CreateServiceGrantsOnSourceKey
+                Effect: Allow
+                Action: kms:CreateGrant
+                Resource: !Ref SourceKmsKeyArn
+                Condition:
+                  Bool:
+                    kms:GrantIsForAWSResource: 'true'
+
+  ValidationHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - !If
+          - HasToolsBucket
+          - PolicyName: ReadValidationTools
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${ToolsBucketName}/*'
+          - !Ref AWS::NoValue
+
+  ValidationHostInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ValidationHostRole
+
+  TemplateVersionParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /recovery/foundation/template-version
+      Type: String
+      Value: !Ref TemplateVersion
+  VpcIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /recovery/foundation/vpc-id
+      Type: String
+      Value: !Ref RecoveryVpc
+  VpcCidrParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /recovery/foundation/vpc-cidr
+      Type: String
+      Value: !Ref VpcCidr
+  SubnetAParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /recovery/foundation/subnet-a-id
+      Type: String
+      Value: !Ref SubnetA
+  SubnetBParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /recovery/foundation/subnet-b-id
+      Type: String
+      Value: !Ref SubnetB
+  DbSubnetGroupParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /recovery/foundation/db-subnet-group-name
+      Type: String
+      Value: !Ref DbSubnetGroup
+  EndpointSecurityGroupParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /recovery/foundation/endpoint-security-group-id
+      Type: String
+      Value: !GetAtt EndpointSecurityGroup.GroupId
+  BackupServiceRoleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /recovery/foundation/backup-service-role-arn
+      Type: String
+      Value: !GetAtt BackupServiceRole.Arn
+  ValidationInstanceProfileParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /recovery/foundation/validation-instance-profile-arn
+      Type: String
+      Value: !GetAtt ValidationHostInstanceProfile.Arn
+  SourceKmsKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /recovery/foundation/source-kms-key-arn
+      Type: String
+      Value: !Ref SourceKmsKeyArn
+
+Outputs:
+  VpcId:
+    Value: !Ref RecoveryVpc
+  SubnetAId:
+    Value: !Ref SubnetA
+  SubnetBId:
+    Value: !Ref SubnetB
+  DbSubnetGroupName:
+    Value: !Ref DbSubnetGroup
+  EndpointSecurityGroupId:
+    Value: !GetAtt EndpointSecurityGroup.GroupId
+  BackupServiceRoleArn:
+    Value: !GetAtt BackupServiceRole.Arn
+  ValidationInstanceProfileArn:
+    Value: !GetAtt ValidationHostInstanceProfile.Arn
+  FoundationKeyArn:
+    Value: !GetAtt FoundationKey.Arn

@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  One-time bootstrap for the Recovery App account. Creates the SSM Automation
+  execution role that Bunker Delegated Admin assumes for multi-account
+  automation, and the CloudFormation service role that alone creates the
+  recovery stacks' resources. Deploy once, by hand, in the recovery Region.
+
+Parameters:
+  DelegatedAdminAccountId:
+    Type: String
+    AllowedPattern: '^[0-9]{12}$'
+  RecoveryRegion:
+    Type: String
+    Default: ap-east-1
+    AllowedPattern: '^[a-z]{2}-[a-z]+-[0-9]$'
+
+Resources:
+  # Fixed name: SSM multi-account automation assumes this role in every target.
+  AutomationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWS-SystemsManager-AutomationExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: TrustDelegatedAdminAutomationAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${DelegatedAdminAccountId}:role/AWS-SystemsManager-AutomationAdministrationRole'
+            Action: sts:AssumeRole
+          - Sid: TrustSystemsManagerInThisAccount
+            Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: ManageRecoveryStacks
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ManageOnlyTheRecoveryStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:DescribeStacks
+                  - cloudformation:GetTemplate
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${RecoveryRegion}:${AWS::AccountId}:stack/recovery-foundation/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${RecoveryRegion}:${AWS::AccountId}:stack/recovery-app-*/*'
+              - Sid: ListStacksForDependencyChecks
+                Effect: Allow
+                Action: cloudformation:ListStacks
+                Resource: '*'
+              - Sid: PassOnlyTheCloudFormationServiceRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationServiceRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: VerifyWhatWasBuilt
+                Effect: Allow
+                Action:
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcEndpoints
+                Resource: '*'
+              - Sid: ReadRecoveryConfiguration
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${RecoveryRegion}:${AWS::AccountId}:parameter/recovery'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${RecoveryRegion}:${AWS::AccountId}:parameter/recovery/*'
+
+  # The only identity that creates the recovery stacks' resources. Names it can
+  # create are limited to the recovery-* prefix that CloudFormation generates
+  # for these stacks.
+  CloudFormationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: RecoveryCloudFormationRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: CreateRecoveryFoundation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: NetworkInTheRecoveryRegionOnly
+                Effect: Allow
+                Action:
+                  - ec2:AssociateRouteTable
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:CreateFlowLogs
+                  - ec2:CreateRouteTable
+                  - ec2:CreateSecurityGroup
+                  - ec2:CreateSubnet
+                  - ec2:CreateTags
+                  - ec2:CreateVpc
+                  - ec2:CreateVpcEndpoint
+                  - ec2:DeleteFlowLogs
+                  - ec2:DeleteRouteTable
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DeleteSubnet
+                  - ec2:DeleteTags
+                  - ec2:DeleteVpc
+                  - ec2:DeleteVpcEndpoints
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeFlowLogs
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribePrefixLists
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeSecurityGroupRules
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcAttribute
+                  - ec2:DescribeVpcEndpoints
+                  - ec2:DescribeVpcs
+                  - ec2:DisassociateRouteTable
+                  - ec2:ModifySubnetAttribute
+                  - ec2:ModifyVpcAttribute
+                  - ec2:ModifyVpcEndpoint
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - route53:AssociateVPCWithHostedZone
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref RecoveryRegion
+              - Sid: FlowLogGroups
+                Effect: Allow
+                Action:
+                  - logs:AssociateKmsKey
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:ListTagsForResource
+                  - logs:PutRetentionPolicy
+                  - logs:TagResource
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref RecoveryRegion
+              - Sid: CreateKeys
+                Effect: Allow
+                Action: kms:CreateKey
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref RecoveryRegion
+              - Sid: ManageRecoveryKeysAndAliases
+                Effect: Allow
+                Action:
+                  - kms:CreateAlias
+                  - kms:DeleteAlias
+                  - kms:DescribeKey
+                  - kms:EnableKeyRotation
+                  - kms:GetKeyPolicy
+                  - kms:GetKeyRotationStatus
+                  - kms:ListResourceTags
+                  - kms:PutKeyPolicy
+                  - kms:TagResource
+                  - kms:UpdateAlias
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:kms:${RecoveryRegion}:${AWS::AccountId}:key/*'
+                  - !Sub 'arn:${AWS::Partition}:kms:${RecoveryRegion}:${AWS::AccountId}:alias/recovery/*'
+              - Sid: RecoveryRolesAndInstanceProfilesOnly
+                Effect: Allow
+                Action:
+                  - iam:AddRoleToInstanceProfile
+                  - iam:CreateInstanceProfile
+                  - iam:CreateRole
+                  - iam:DeleteInstanceProfile
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:GetInstanceProfile
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                  - iam:PutRolePolicy
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/recovery-*'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/recovery-*'
+              - Sid: AttachOnlyApprovedManagedPolicies
+                Effect: Allow
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/recovery-*'
+                Condition:
+                  ArnEquals:
+                    iam:PolicyARN:
+                      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup'
+                      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores'
+                      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AWSBackupServiceRolePolicyForS3Backup'
+                      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AWSBackupServiceRolePolicyForS3Restore'
+                      - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+              - Sid: PassFlowLogRoleToFlowLogsOnly
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/recovery-*'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - vpc-flow-logs.amazonaws.com
+                      - ec2.amazonaws.com
+              - Sid: RecoveryDbSubnetGroups
+                Effect: Allow
+                Action:
+                  - rds:AddTagsToResource
+                  - rds:CreateDBSubnetGroup
+                  - rds:DeleteDBSubnetGroup
+                  - rds:DescribeDBSubnetGroups
+                  - rds:ListTagsForResource
+                  - rds:ModifyDBSubnetGroup
+                Resource: !Sub 'arn:${AWS::Partition}:rds:${RecoveryRegion}:${AWS::AccountId}:subgrp:recovery-*'
+              - Sid: RecoveryParameters
+                Effect: Allow
+                Action:
+                  - ssm:AddTagsToResource
+                  - ssm:DeleteParameter
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${RecoveryRegion}:${AWS::AccountId}:parameter/recovery/*'
+              - Sid: DescribeParameters
+                Effect: Allow
+                Action: ssm:DescribeParameters
+                Resource: '*'
+
+Outputs:
+  AutomationExecutionRoleArn:
+    Value: !GetAtt AutomationExecutionRole.Arn
+  CloudFormationServiceRoleArn:
+    Value: !GetAtt CloudFormationServiceRole.Arn

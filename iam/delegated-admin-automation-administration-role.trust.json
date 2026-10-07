@@ -1,0 +1,21 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowSystemsManagerAutomation",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ssm.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceAccount": "DELEGATED_ADMIN_ACCOUNT_ID"
+        },
+        "ArnLike": {
+          "aws:SourceArn": "arn:aws:ssm:RECOVERY_REGION:DELEGATED_ADMIN_ACCOUNT_ID:automation-execution/*"
+        }
+      }
+    }
+  ]
+}
