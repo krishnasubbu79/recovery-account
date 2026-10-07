@@ -64,6 +64,8 @@ recovery-foundation (ap-east-1)
 2. Deletes the stack and confirms it is gone.
 3. Retains the flow-log group and the foundation KMS key as evidence. The alias is removed, so a later `CREATE` works.
 
+> **Deploying step 1?** Follow [`DEPLOYMENT_GUIDE.md`](DEPLOYMENT_GUIDE.md): a step-by-step procedure with a check after every step. The sections below are a summary.
+
 ## Prerequisites
 
 1. **Enable ap-east-1** (an opt-in Region) in Delegated Admin, the recovery account, the Bunker key account, and the Prod LAG account.
